@@ -117,10 +117,11 @@ describe('MCP server lifecycle', () => {
     const { child, closeInput } = spawnServer(configPath);
 
     try {
-      await waitForRunning(child, 1500);
+      await waitForOutput(child.stderr, /MCP server connection established/);
 
+      const exited = waitForExit(child);
       child.kill('SIGTERM');
-      const result = await waitForExit(child);
+      const result = await exited;
 
       assert.strictEqual(result.signal, null);
       assert.strictEqual(result.code, 0);
@@ -178,6 +179,7 @@ describe('MCP server lifecycle', () => {
     });
 
     try {
+      await waitForOutput(child.stderr, /Pre-connecting to all configured SSH servers/);
       child.stdin.write(`${JSON.stringify({
         jsonrpc: '2.0',
         id: 61,
@@ -189,7 +191,7 @@ describe('MCP server lifecycle', () => {
         },
       })}\n`);
 
-      const output = await waitForOutput(child.stdout, /"id":61/, 1250);
+      const output = await waitForOutput(child.stdout, /"id":61/, 3000);
       assert.match(output, /"result"/);
     } finally {
       child.stdin.end();

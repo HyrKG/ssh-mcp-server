@@ -257,8 +257,8 @@ describe('MCP HTTP transport', () => {
     const { child, tmpDir } = startServer(['--http-host', '0.0.0.0']);
 
     try {
-      const output = await waitForOutput(child.stderr, /not a loopback address/);
-      assert.match(output, /no bearer token/);
+      const output = await waitForOutput(child.stderr, /no bearer token/);
+      assert.match(output, /not a loopback address/);
 
       const endpoint = output.match(endpointPattern)[1].replace('0.0.0.0', '127.0.0.1');
       const initialized = await postJson(endpoint, initializeBody);

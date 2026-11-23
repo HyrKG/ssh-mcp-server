@@ -4,6 +4,7 @@ import type { Socket } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { HttpListenConfig } from "../models/types.js";
+import type { StagingHttpHandler } from "../staging/staging-http-handler.js";
 import { Logger } from "../utils/logger.js";
 
 const JSON_RPC_HEADERS = {
@@ -60,6 +61,11 @@ export function allowedHostHeaders(listenHost: string, port: number): string[] |
   });
 }
 
+function bearerToken(req: IncomingMessage): string | undefined {
+  const header = req.headers.authorization;
+  return typeof header === "string" ? /^Bearer\s+(\S+)\s*$/i.exec(header)?.[1] : undefined;
+}
+
 function safeEqual(provided: string, expected: string): boolean {
   const providedBuffer = Buffer.from(provided);
   const expectedBuffer = Buffer.from(expected);
@@ -95,11 +101,18 @@ export class McpHttpServer {
   constructor(
     private readonly config: HttpListenConfig,
     private readonly createMcpServer: () => McpServer,
+    private readonly staging?: StagingHttpHandler,
   ) {}
 
   async listen(): Promise<string> {
     const httpServer = createServer((req, res) => {
       void this.handle(req, res);
+    });
+    httpServer.on("checkContinue", (req, res) => {
+      if (!this.stagingPath(req)) {
+        res.writeContinue();
+      }
+      void this.handle(req, res, true);
     });
     this.server = httpServer;
 
@@ -172,27 +185,26 @@ export class McpHttpServer {
     }
   }
 
-  private authorized(req: IncomingMessage): boolean {
-    const token = this.config.token;
-    if (!token) {
-      return true;
+  private stagingPath(req: IncomingMessage): string | undefined {
+    const pathname = req.url?.split("?", 1)[0];
+    if (this.staging && pathname &&
+        (pathname === this.staging.path || pathname.startsWith(this.staging.path + "/"))) {
+      return pathname;
     }
-
-    const header = req.headers.authorization;
-    if (typeof header !== "string") {
-      return false;
-    }
-
-    const match = /^Bearer\s+(\S+)\s*$/i.exec(header);
-    if (!match) {
-      return false;
-    }
-
-    return safeEqual(match[1], token);
+    return undefined;
   }
 
-  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handle(req: IncomingMessage, res: ServerResponse, expectContinue = false): Promise<void> {
     try {
+      const bearer = bearerToken(req);
+      const token = this.config.token;
+      const masterAuthorized = !!token && !!bearer && safeEqual(bearer, token);
+      const stagingPath = this.stagingPath(req);
+      if (this.staging && stagingPath) {
+        await this.staging.handle(req, res, stagingPath, bearer, masterAuthorized, this.allowedHosts, expectContinue);
+        return;
+      }
+
       const pathname = this.requestPath(req);
       if (!pathname) {
         writeJson(res, 400, {
@@ -212,7 +224,7 @@ export class McpHttpServer {
         return;
       }
 
-      if (!this.authorized(req)) {
+      if (token && !masterAuthorized) {
         res.setHeader("WWW-Authenticate", 'Bearer realm="ssh-mcp-server"');
         writeJson(res, 401, {
           jsonrpc: "2.0",
