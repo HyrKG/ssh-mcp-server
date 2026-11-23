@@ -6,6 +6,8 @@ import { Logger } from "../utils/logger.js";
 import { registerAllTools } from "../tools/index.js";
 import { SERVER_CONFIG } from "../config/server.js";
 import { isLoopbackHost, McpHttpServer } from "./http-server.js";
+import { StagingStore } from "../staging/staging-store.js";
+import { StagingHttpHandler } from "../staging/staging-http-handler.js";
 import type { ParsedArgs } from "../models/types.js";
 
 /**
@@ -14,6 +16,8 @@ import type { ParsedArgs } from "../models/types.js";
 export class SshMcpServer {
   private server?: McpServer;
   private httpServer?: McpHttpServer;
+  private staging?: StagingStore;
+  private publicBaseUrl?: string;
   private sshManager: SSHConnectionManager;
   private shutdownHandlersRegistered = false;
   private shutdownPromise?: Promise<void>;
@@ -24,7 +28,9 @@ export class SshMcpServer {
 
   private createMcpServer(): McpServer {
     const server = new McpServer(SERVER_CONFIG);
-    registerAllTools(server);
+    registerAllTools(server, this.staging && this.publicBaseUrl
+      ? { store: this.staging, publicBaseUrl: this.publicBaseUrl }
+      : undefined);
     return server;
   }
 
@@ -42,6 +48,7 @@ export class SshMcpServer {
           );
         }
 
+        this.staging?.close();
         this.sshManager.disconnect();
 
         if (!this.server) {
@@ -144,9 +151,22 @@ export class SshMcpServer {
     this.registerShutdownHandlers(parsedArgs.mcpTransport);
 
     if (parsedArgs.mcpTransport === "http") {
-      this.httpServer = new McpHttpServer(parsedArgs.http, () => this.createMcpServer());
-      const endpoint = await this.httpServer.listen();
-      Logger.log(`MCP HTTP server listening on ${endpoint}`);
+      this.staging = new StagingStore(parsedArgs.http.staging);
+      this.sshManager.setStagingRoot(this.staging.root);
+      this.httpServer = new McpHttpServer(
+        parsedArgs.http,
+        () => this.createMcpServer(),
+        new StagingHttpHandler(this.staging, parsedArgs.http.path),
+      );
+      try {
+        const endpoint = await this.httpServer.listen();
+        this.publicBaseUrl = parsedArgs.http.publicUrl ?? endpoint.replace(/\/+$/, "");
+        Logger.log(`MCP HTTP server listening on ${endpoint}`);
+      } catch (error) {
+        this.staging.close();
+        this.sshManager.setStagingRoot(undefined);
+        throw error;
+      }
     } else {
       this.server = this.createMcpServer();
       const transport = new StdioServerTransport();

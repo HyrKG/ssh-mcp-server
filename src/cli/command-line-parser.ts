@@ -1,5 +1,5 @@
 import { parseArgs } from "node:util";
-import { SSHConfig, SshConnectionConfigMap, ParsedArgs, McpTransport } from "../models/types.js";
+import { SSHConfig, SshConnectionConfigMap, ParsedArgs, McpTransport, type HttpListenConfig } from "../models/types.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -113,6 +113,33 @@ export class CommandLineParser {
     return token || undefined;
   }
 
+  private static parsePublicUrl(value: string | undefined): string | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    try {
+      const url = new URL(value);
+      if ((url.protocol === "http:" || url.protocol === "https:") &&
+          !url.username && !url.password && !url.search && !url.hash && !/[?#]/.test(value)) {
+        return url.href.replace(/\/+$/, "");
+      }
+    } catch {
+      // Report invalid URLs without repeating potential credentials.
+    }
+    throw new Error("HTTP public URL must be an absolute HTTP(S) URL without credentials, query, or fragment.");
+  }
+
+  private static parseStagingLimit(value: string | undefined, option: string): number | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    const number = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(number) || number <= 0) {
+      throw new Error(`--${option} must be a positive safe integer.`);
+    }
+    return number;
+  }
+
   private static parseTimeout(
     value: unknown,
     fieldName: string,
@@ -182,6 +209,11 @@ export class CommandLineParser {
         "http-port": { type: "string" },
         "http-path": { type: "string" },
         "http-token": { type: "string" },
+        "http-public-url": { type: "string" },
+        "staging-dir": { type: "string" },
+        "staging-max-file-bytes": { type: "string" },
+        "staging-max-total-bytes": { type: "string" },
+        "staging-ttl-ms": { type: "string" },
       },
       allowPositionals: true,
     });
@@ -504,15 +536,38 @@ export class CommandLineParser {
       }
     }
 
+    const mcpTransport = this.parseMcpTransport(values["mcp-transport"]);
+    const httpExtensions: Partial<HttpListenConfig> = {};
+    if (mcpTransport === "http") {
+      const publicUrl = this.parsePublicUrl(values["http-public-url"] ?? process.env.SSH_MCP_HTTP_PUBLIC_URL);
+      if (publicUrl !== undefined) {
+        httpExtensions.publicUrl = publicUrl;
+      }
+      const dir = values["staging-dir"] ?? process.env.SSH_MCP_STAGING_DIR;
+      if (dir !== undefined && !dir.trim()) {
+        throw new Error("--staging-dir must be a non-empty path.");
+      }
+      const staging = {
+        dir,
+        maxFileBytes: this.parseStagingLimit(values["staging-max-file-bytes"] ?? process.env.SSH_MCP_STAGING_MAX_FILE_BYTES, "staging-max-file-bytes"),
+        maxTotalBytes: this.parseStagingLimit(values["staging-max-total-bytes"] ?? process.env.SSH_MCP_STAGING_MAX_TOTAL_BYTES, "staging-max-total-bytes"),
+        ttlMs: this.parseStagingLimit(values["staging-ttl-ms"] ?? process.env.SSH_MCP_STAGING_TTL_MS, "staging-ttl-ms"),
+      };
+      if (Object.values(staging).some((value) => value !== undefined)) {
+        httpExtensions.staging = staging;
+      }
+    }
+
     return {
       configs: configMap,
       preConnect: values["pre-connect"] === true,
-      mcpTransport: this.parseMcpTransport(values["mcp-transport"]),
+      mcpTransport,
       http: {
         host: this.parseHttpHost(values["http-host"]),
         port: this.parseHttpPort(values["http-port"]),
         path: this.parseHttpPath(values["http-path"]),
         token: this.parseHttpToken(values["http-token"]),
+        ...httpExtensions,
       },
     };
   }

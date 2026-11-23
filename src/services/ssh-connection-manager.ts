@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import type { Client, ClientChannel, Prompt, SFTPWrapper, Stats } from "ssh2";
 import {
@@ -7,6 +8,8 @@ import {
 } from "../models/types.js";
 import { Logger } from "../utils/logger.js";
 import { collectSystemStatus } from "../utils/status-collector.js";
+import { isPathWithinRoot } from "../utils/local-path.js";
+import type { StagingSource } from "../staging/staging-store.js";
 import { ToolError } from "../utils/tool-error.js";
 import { shellQuote } from "../utils/shell.js";
 import {
@@ -166,16 +169,6 @@ function describeAllowedRoots(
   return `Allowed ${kind} paths for this connection: ${allowedRoots.join(", ")}.`;
 }
 
-function isPathWithinRoot(candidate: string, root: string): boolean {
-  const relativePath = path.relative(root, candidate);
-  return (
-    relativePath === "" ||
-    (relativePath !== "" &&
-      !relativePath.startsWith("..") &&
-      !path.isAbsolute(relativePath))
-  );
-}
-
 function redactProxyUrl(proxyUrl: URL): string {
   const redactedUrl = new URL(proxyUrl.toString());
   if (redactedUrl.username) {
@@ -253,6 +246,7 @@ export class SSHConnectionManager {
   // needs one decoder for its whole lifetime rather than a decode per chunk.
   private shellDecoders: Map<string, StringDecoder> = new Map();
   private defaultName: string = "default";
+  private stagingRoot?: string;
 
   private constructor() {}
 
@@ -561,9 +555,10 @@ export class SSHConnectionManager {
     return this.runCommandInternal(cmdString, directory, name, options);
   }
 
-  /**
-   * Upload file
-   */
+  public setStagingRoot(root: string | undefined): void {
+    this.stagingRoot = root;
+  }
+
   private validateLocalPath(
     localPath: string,
     name?: string,
@@ -598,6 +593,13 @@ export class SSHConnectionManager {
       pathToCheck = resolvedPath;
     }
 
+    const stagingRoot = this.stagingRoot;
+    if (stagingRoot && [resolvedPath, pathToCheck, parentRealPath].some(
+      (candidate) => candidate !== undefined && isPathWithinRoot(candidate, stagingRoot),
+    )) {
+      throw new ToolError("LOCAL_PATH_NOT_ALLOWED", "Use transferId to access the staging directory.");
+    }
+
     if (purpose === "write" && !parentRealPath) {
       throw new ToolError(
         "LOCAL_PATH_NOT_ALLOWED",
@@ -609,9 +611,10 @@ export class SSHConnectionManager {
       );
     }
 
-    const isAllowed = allowedRoots.some((allowedRoot) =>
-      isPathWithinRoot(pathToCheck, allowedRoot),
-    );
+    const isAllowed = allowedRoots.some((allowedRoot) => {
+      const relative = path.relative(allowedRoot, pathToCheck);
+      return !relative.startsWith("..") && !path.isAbsolute(relative);
+    });
 
     if (!isAllowed) {
       throw new ToolError(
@@ -714,7 +717,6 @@ export class SSHConnectionManager {
     name?: string,
   ): Promise<string> {
     const config = this.getConfig(name);
-    const key = name || this.defaultName;
     if (this.getTransportMode(config) === "shell") {
       throw new ToolError(
         "UNSUPPORTED_IN_SHELL_MODE",
@@ -733,52 +735,73 @@ export class SSHConnectionManager {
       return this.uploadDirectory(validatedLocalPath, validatedRemotePath, name);
     }
 
-    const client = await this.ensureConnected(name);
-    const sftpTimeoutMs = this.getSftpTimeoutMs(config);
-    const sftp = await this.withTimeout(
-      this.openSftp(client),
-      sftpTimeoutMs,
-      () => this.invalidateConnection(key),
-      `SFTP open timed out after ${sftpTimeoutMs}ms`,
-    );
+    return this.uploadFile(validatedLocalPath, validatedRemotePath, name);
+  }
+
+  public async uploadStagedFile(
+    localPath: string,
+    remotePath: string,
+    metadata: { sizeBytes: number; sha256: string; verifySha256?: boolean; stream: () => Readable },
+    name?: string,
+  ): Promise<void> {
+    const validatedRemotePath = this.validateRemotePath(remotePath, name);
+    await this.uploadFile(localPath, validatedRemotePath, name, metadata);
+  }
+
+  private async uploadFile(
+    validatedLocalPath: string,
+    validatedRemotePath: string,
+    name?: string,
+    staged?: { sizeBytes: number; sha256: string; verifySha256?: boolean; stream: () => Readable },
+  ): Promise<string> {
+    const { sftp, key, timeoutMs } = await this.openSftpFor(name);
+    const timed = <T>(promise: Promise<T>, operation: string) =>
+      this.withTimeout(promise, timeoutMs, () => this.invalidateConnection(key),
+        `SFTP ${operation} timed out after ${timeoutMs}ms`);
 
     try {
-      const localSize = await this.getLocalSizeForFastTransfer(
-        validatedLocalPath,
-      );
+      const fastSize = staged
+        ? (staged.sizeBytes >= SFTP_FAST_TRANSFER_MIN_BYTES ? staged.sizeBytes : undefined)
+        : await this.getLocalSizeForFastTransfer(validatedLocalPath);
 
-      if (localSize === undefined) {
-        await this.withTimeout(
-          pipeline(
-            fs.createReadStream(validatedLocalPath),
-            sftp.createWriteStream(validatedRemotePath),
-          ),
-          sftpTimeoutMs,
-          () => this.invalidateConnection(key),
-          `SFTP upload timed out after ${sftpTimeoutMs}ms`,
-        );
+      if (fastSize === undefined) {
+        await timed(pipeline(
+          staged ? staged.stream() : fs.createReadStream(validatedLocalPath),
+          sftp.createWriteStream(validatedRemotePath),
+        ), "upload");
       } else {
-        await this.withTimeout(
-          new Promise<void>((resolve, reject) => {
-            sftp.fastPut(
-              validatedLocalPath,
-              validatedRemotePath,
-              SFTP_FAST_TRANSFER_OPTIONS,
-              (err) => (err ? reject(err) : resolve()),
-            );
-          }),
-          sftpTimeoutMs,
-          () => this.invalidateConnection(key),
-          `SFTP upload timed out after ${sftpTimeoutMs}ms`,
-        );
-        await this.appendUploadTail(
-          sftp,
-          validatedLocalPath,
-          validatedRemotePath,
-          localSize,
-          sftpTimeoutMs,
-          key,
-        );
+        const options = staged ? { ...SFTP_FAST_TRANSFER_OPTIONS, fileSize: fastSize } : SFTP_FAST_TRANSFER_OPTIONS;
+        await timed(new Promise<void>((resolve, reject) => {
+          sftp.fastPut(validatedLocalPath, validatedRemotePath, options, (err) => err ? reject(err) : resolve());
+        }), "upload");
+
+        if (!staged) {
+          await this.appendUploadTail(sftp, validatedLocalPath, validatedRemotePath, fastSize, timeoutMs, key);
+        }
+      }
+
+      if (staged) {
+        const remote = await timed(this.statRemote(sftp, validatedRemotePath), "stat");
+        if (!remote.isFile() || remote.size !== staged.sizeBytes) {
+          throw new Error("Remote file size differs from staged file after upload.");
+        }
+        if (staged.verifySha256) {
+          const hash = createHash("sha256");
+          const stream = sftp.createReadStream(validatedRemotePath);
+          await timed(pipeline(stream, async (chunks) => {
+            let verifiedBytes = 0;
+            for await (const chunk of chunks) {
+              verifiedBytes += chunk.length;
+              if (verifiedBytes > staged.sizeBytes) {
+                throw new Error("Remote file grew during SHA-256 verification.");
+              }
+              hash.update(chunk);
+            }
+          }), "verification");
+          if (hash.digest("hex") !== staged.sha256) {
+            throw new Error("Remote SHA-256 differs from staged file after upload.");
+          }
+        }
       }
       return "File uploaded successfully";
     } catch (error) {
@@ -870,14 +893,7 @@ export class SSHConnectionManager {
         // Claiming the temp name first keeps it.
         await fs.promises.writeFile(tempLocalPath, "", { flag: "wx" });
         await this.withTimeout(
-          new Promise<void>((resolve, reject) => {
-            sftp.fastGet(
-              validatedRemotePath,
-              tempLocalPath,
-              SFTP_FAST_TRANSFER_OPTIONS,
-              (err) => (err ? reject(err) : resolve()),
-            );
-          }),
+          this.fastGetFile(sftp, validatedRemotePath, tempLocalPath),
           sftpTimeoutMs,
           () => this.invalidateConnection(key),
           `SFTP download timed out after ${sftpTimeoutMs}ms`,
@@ -915,6 +931,70 @@ export class SSHConnectionManager {
     } finally {
       this.closeSftp(sftp);
     }
+  }
+
+  public async downloadFileTo<T>(
+    remotePath: string,
+    save: (size: number, source: StagingSource) => Promise<T>,
+    name?: string,
+  ): Promise<T> {
+    const validatedRemotePath = this.validateRemotePath(remotePath, name);
+    const { sftp, key, timeoutMs } = await this.openSftpFor(name);
+    const timed = <R>(promise: Promise<R>, operation: string) =>
+      this.withTimeout(promise, timeoutMs, () => this.invalidateConnection(key),
+        `SFTP ${operation} timed out after ${timeoutMs}ms`);
+    let signal: AbortSignal | undefined;
+    try {
+      const stats = await timed(this.statRemote(sftp, validatedRemotePath), "stat");
+      if (!stats.isFile()) {
+        throw new ToolError("SFTP_ERROR", "Staging requires a regular remote file. For a directory, use tar or specify localPath.");
+      }
+      const size = stats.size;
+      if (!Number.isSafeInteger(size) || size < 0) {
+        throw new ToolError("SFTP_ERROR", "Remote file has an invalid size.");
+      }
+      if (size >= SFTP_FAST_TRANSFER_MIN_BYTES) {
+        return await save(size, {
+          fastGet: async (partPath) => {
+            const transfer = this.fastGetFile(sftp, validatedRemotePath, partPath, size);
+            try {
+              await timed(transfer, "download");
+            } catch (error) {
+              if (error instanceof ToolError && error.code === "OPERATION_TIMEOUT") {
+                void transfer.catch(() => {}).then(() => this.unlinkIfExists(partPath));
+              }
+              throw error;
+            }
+            const after = await timed(this.statRemote(sftp, validatedRemotePath), "stat");
+            if (after.size !== size || after.mtime !== stats.mtime) {
+              throw new ToolError("TRANSFER_INCOMPLETE", "Remote file changed during download.", true);
+            }
+          },
+        });
+      }
+      signal = AbortSignal.timeout(timeoutMs);
+      return await save(size, { stream: () => sftp.createReadStream(validatedRemotePath), signal });
+    } catch (error) {
+      if (signal?.aborted && (error as Error).name === "AbortError") {
+        this.invalidateConnection(key);
+        throw new ToolError("OPERATION_TIMEOUT", `SFTP download timed out after ${timeoutMs}ms`, true);
+      }
+      if (error instanceof ToolError) {
+        throw error;
+      }
+      throw new ToolError("SFTP_ERROR", `File download failed: ${(error as Error).message}`, true);
+    } finally {
+      this.closeSftp(sftp);
+    }
+  }
+
+  private fastGetFile(sftp: SFTPWrapper, remotePath: string, localPath: string, fileSize?: number): Promise<void> {
+    const options = fileSize === undefined
+      ? SFTP_FAST_TRANSFER_OPTIONS
+      : { ...SFTP_FAST_TRANSFER_OPTIONS, fileSize };
+    return new Promise<void>((resolve, reject) => {
+      sftp.fastGet(remotePath, localPath, options, (error) => error ? reject(error) : resolve());
+    });
   }
 
   private assertSftpAllowed(config: SSHConfig): void {
@@ -1107,12 +1187,21 @@ export class SSHConnectionManager {
     const dirs: string[] = [remoteDir];
     let skipped = 0;
 
+    const stagingRoot = this.stagingRoot;
+    const realLocalDir = stagingRoot && this.tryRealpath(localDir);
+    const stagingPath = stagingRoot && realLocalDir && isPathWithinRoot(stagingRoot, realLocalDir)
+      ? path.join(localDir, path.relative(realLocalDir, stagingRoot))
+      : undefined;
     const walk = async (local: string, remote: string): Promise<void> => {
       for (const entry of await fs.promises.readdir(local, {
         withFileTypes: true,
       })) {
         const localChild = path.join(local, entry.name);
         const remoteChild = path.posix.join(remote, entry.name);
+        if (localChild === stagingPath) {
+          skipped++;
+          continue;
+        }
         if (entry.isDirectory()) {
           dirs.push(remoteChild);
           await walk(localChild, remoteChild);

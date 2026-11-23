@@ -34,6 +34,11 @@ Options:
   --http-port <port>              Listen port for HTTP transport (default: 3000)
   --http-path <path>              Endpoint path for HTTP transport (default: /mcp)
   --http-token <token>            Bearer token for HTTP; falls back to SSH_MCP_HTTP_TOKEN
+  --http-public-url <url>         Public MCP base URL (SSH_MCP_HTTP_PUBLIC_URL)
+  --staging-dir <path>            HTTP staging directory (SSH_MCP_STAGING_DIR)
+  --staging-max-file-bytes <n>    Per-file limit (SSH_MCP_STAGING_MAX_FILE_BYTES, default: 104857600)
+  --staging-max-total-bytes <n>   Total limit (SSH_MCP_STAGING_MAX_TOTAL_BYTES, default: 1073741824)
+  --staging-ttl-ms <ms>           File lifetime (SSH_MCP_STAGING_TTL_MS, default: 1800000)
   --version, -v                   Print package version
   --help                          Print this help message`;
 

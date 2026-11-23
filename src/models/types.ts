@@ -1,3 +1,4 @@
+import type { StagingConfig } from "../staging/staging-store.js";
 import type { Algorithms } from "ssh2";
 
 /**
@@ -105,6 +106,8 @@ export interface HttpListenConfig {
   port: number;
   path: string;
   token?: string;
+  publicUrl?: string;
+  staging?: StagingConfig;
 }
 
 /**
